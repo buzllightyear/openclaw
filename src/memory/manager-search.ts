@@ -171,6 +171,29 @@ export function updateRecallStats(params: { db: DatabaseSync; chunkIds: string[]
   }
 }
 
+// P3: Update useful_count for chunks that contributed to a positively-received response
+export function updateUsefulStats(params: { db: DatabaseSync; chunkIds: string[] }): void {
+  if (params.chunkIds.length === 0) {
+    return;
+  }
+  const now = Date.now();
+  try {
+    const updateChunks = params.db.prepare(
+      `UPDATE chunks SET useful_count = COALESCE(useful_count, 0) + 1 WHERE id = ?`,
+    );
+    const updateStats = params.db.prepare(
+      `UPDATE memory_stats SET useful_count = useful_count + 1, updated_at = ?
+       WHERE content_hash = (SELECT content_hash FROM chunks WHERE id = ?)`,
+    );
+    for (const id of params.chunkIds) {
+      updateChunks.run(id);
+      updateStats.run(now, id);
+    }
+  } catch {
+    // Useful tracking is best-effort
+  }
+}
+
 // P2: RRF (Reciprocal Rank Fusion) merge of vector + keyword results
 export function rrfMerge(params: {
   vectorResults: SearchRowResult[];

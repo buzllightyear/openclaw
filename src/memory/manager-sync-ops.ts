@@ -1395,6 +1395,8 @@ export abstract class MemoryManagerSyncOps {
     newText: string;
     newEmbedding: number[];
     threshold?: number;
+    newRecallCount?: number;
+    newUsefulCount?: number;
   }): {
     isDuplicate: boolean;
     existingId?: string;
@@ -1425,23 +1427,39 @@ export abstract class MemoryManagerSyncOps {
           const mergedRecall = candidate.recall_count ?? 0;
           const mergedUseful = candidate.useful_count ?? 0;
 
-          // Keep the longer (richer) text
+          // Keep the longer (richer) text and merge counts into existing chunk
+          const now = Date.now();
           if (params.newText.length > candidate.text.length) {
-            // New text is richer — update existing chunk's text but keep its ID
             const contentHash = createHash("sha256")
               .update(params.newText)
               .digest("hex")
               .slice(0, 16);
             this.db
-              .prepare(`UPDATE chunks SET text = ?, content_hash = ?, updated_at = ? WHERE id = ?`)
-              .run(params.newText, contentHash, Date.now(), candidate.id);
+              .prepare(
+                `UPDATE chunks SET text = ?, content_hash = ?, recall_count = COALESCE(recall_count, 0) + ?, useful_count = COALESCE(useful_count, 0) + ?, updated_at = ? WHERE id = ?`,
+              )
+              .run(
+                params.newText,
+                contentHash,
+                params.newRecallCount ?? 0,
+                params.newUsefulCount ?? 0,
+                now,
+                candidate.id,
+              );
+          } else {
+            // Existing text is richer — just merge counts
+            this.db
+              .prepare(
+                `UPDATE chunks SET recall_count = COALESCE(recall_count, 0) + ?, useful_count = COALESCE(useful_count, 0) + ?, updated_at = ? WHERE id = ?`,
+              )
+              .run(params.newRecallCount ?? 0, params.newUsefulCount ?? 0, now, candidate.id);
           }
 
           return {
             isDuplicate: true,
             existingId: candidate.id,
-            mergedRecallCount: mergedRecall,
-            mergedUsefulCount: mergedUseful,
+            mergedRecallCount: mergedRecall + (params.newRecallCount ?? 0),
+            mergedUsefulCount: mergedUseful + (params.newUsefulCount ?? 0),
           };
         }
       }

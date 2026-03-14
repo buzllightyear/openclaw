@@ -21,7 +21,12 @@ import { isFileMissingError, statRegularFile } from "./fs-utils.js";
 import { bm25RankToScore, buildFtsQuery, mergeHybridResults } from "./hybrid.js";
 import { isMemoryPath, normalizeExtraMemoryPaths } from "./internal.js";
 import { MemoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
-import { searchKeyword, searchVector, updateRecallStats } from "./manager-search.js";
+import {
+  searchKeyword,
+  searchVector,
+  updateRecallStats,
+  updateUsefulStats,
+} from "./manager-search.js";
 import { runMemoryLifecycle } from "./memory-lifecycle.js";
 import { extractKeywords } from "./query-expansion.js";
 import type {
@@ -268,13 +273,19 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     const results = await this._searchInner(query, opts);
 
     // P3: Update recall stats for returned chunks (best-effort, non-blocking)
+    const chunkIds: string[] = [];
     if (results.length > 0) {
       try {
-        const chunkIds = results
-          .map((r) => (r as MemorySearchResult & { id?: string }).id)
-          .filter((id): id is string => !!id);
+        for (const r of results) {
+          const id = (r as MemorySearchResult & { id?: string }).id;
+          if (id) {
+            chunkIds.push(id);
+          }
+        }
         if (chunkIds.length > 0) {
           updateRecallStats({ db: this.db, chunkIds });
+          // Store last recalled chunk IDs for useful_count tracking
+          this._lastRecalledChunkIds = chunkIds;
         }
       } catch {
         // Recall tracking is best-effort
@@ -864,6 +875,26 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     }
     this.db.close();
     INDEX_CACHE.delete(this.cacheKey);
+  }
+
+  // P3: Track last recalled chunk IDs for useful_count feedback
+  private _lastRecalledChunkIds: string[] = [];
+
+  /**
+   * P3: Mark the most recently recalled chunks as useful.
+   * Call this when user gives positive feedback (e.g. telegram reaction 👍/❤️).
+   */
+  markLastRecalledAsUseful(): number {
+    const ids = this._lastRecalledChunkIds;
+    if (ids.length === 0) {
+      return 0;
+    }
+    try {
+      updateUsefulStats({ db: this.db, chunkIds: ids });
+      return ids.length;
+    } catch {
+      return 0;
+    }
   }
 
   // P4: Run memory lifecycle (promotion/demotion) pipeline
