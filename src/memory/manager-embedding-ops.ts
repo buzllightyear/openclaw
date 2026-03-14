@@ -870,21 +870,23 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       const chunk = chunks[i];
       const embedding = embeddings[i] ?? [];
 
+      const id = hashText(
+        `${options.source}:${entry.path}:${chunk.startLine}:${chunk.endLine}:${chunk.hash}:${this.provider.model}`,
+      );
+
       // P5: Deduplication check before inserting
+      // P6: Also detects perspective shifts (cosine 0.7~0.91) and queues for review
       if (embedding.length > 0) {
         const dedup = this.deduplicateChunk({
           newText: chunk.text,
           newEmbedding: embedding,
           threshold: 0.92,
+          newChunkId: id,
         });
         if (dedup.isDuplicate) {
           continue; // Skip duplicate chunk
         }
       }
-
-      const id = hashText(
-        `${options.source}:${entry.path}:${chunk.startLine}:${chunk.endLine}:${chunk.hash}:${this.provider.model}`,
-      );
       // P0: Generate content_hash for memory_stats tracking
       const contentHash = hashText(chunk.text).slice(0, 16);
       this.db

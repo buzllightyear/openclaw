@@ -897,6 +897,72 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     }
   }
 
+  // P6: Get pending perspective shift reviews for user notification
+  getPendingPerspectiveReviews(): Array<{
+    id: number;
+    existingChunkId: string;
+    existingText: string;
+    existingUsefulCount: number;
+    existingGrade: string;
+    newChunkId: string;
+    newText: string;
+    similarity: number;
+  }> {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT id, existing_chunk_id, existing_text, existing_useful_count,
+                  existing_grade, new_chunk_id, new_text, similarity
+           FROM pending_perspective_reviews
+           WHERE status = 'pending'
+           ORDER BY created_at DESC LIMIT 10`,
+        )
+        .all() as Array<{
+        id: number;
+        existing_chunk_id: string;
+        existing_text: string;
+        existing_useful_count: number;
+        existing_grade: string;
+        new_chunk_id: string;
+        new_text: string;
+        similarity: number;
+      }>;
+      return rows.map((r) => ({
+        id: r.id,
+        existingChunkId: r.existing_chunk_id,
+        existingText: r.existing_text,
+        existingUsefulCount: r.existing_useful_count,
+        existingGrade: r.existing_grade,
+        newChunkId: r.new_chunk_id,
+        newText: r.new_text,
+        similarity: r.similarity,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  // P6: Resolve a perspective review — reset old chunk useful_count or keep both
+  resolvePerspectiveReview(reviewId: number, action: "reset" | "keep"): void {
+    try {
+      if (action === "reset") {
+        const review = this.db
+          .prepare(`SELECT existing_chunk_id FROM pending_perspective_reviews WHERE id = ?`)
+          .get(reviewId) as { existing_chunk_id: string } | undefined;
+        if (review) {
+          this.db
+            .prepare(`UPDATE chunks SET useful_count = 0, updated_at = ? WHERE id = ?`)
+            .run(Date.now(), review.existing_chunk_id);
+        }
+      }
+      this.db
+        .prepare(`UPDATE pending_perspective_reviews SET status = ? WHERE id = ?`)
+        .run(action === "reset" ? "reset" : "kept", reviewId);
+    } catch {
+      // Best-effort
+    }
+  }
+
   // P4: Run memory lifecycle (promotion/demotion) pipeline
   runLifecycle(): { promoted: number; demoted: number; softDeleted: number } {
     try {

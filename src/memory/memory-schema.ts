@@ -99,6 +99,22 @@ export function ensureMemoryIndexSchema(params: {
     );
   `);
 
+  // P6: Perspective shift review queue
+  params.db.exec(`
+    CREATE TABLE IF NOT EXISTS pending_perspective_reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      existing_chunk_id TEXT NOT NULL,
+      existing_text TEXT NOT NULL,
+      existing_useful_count INTEGER DEFAULT 0,
+      existing_grade TEXT,
+      new_chunk_id TEXT NOT NULL,
+      new_text TEXT NOT NULL,
+      similarity REAL NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at INTEGER NOT NULL
+    );
+  `);
+
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);`);
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);`);
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_grade ON chunks(grade);`);

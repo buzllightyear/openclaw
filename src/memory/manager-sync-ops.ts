@@ -1397,17 +1397,20 @@ export abstract class MemoryManagerSyncOps {
     threshold?: number;
     newRecallCount?: number;
     newUsefulCount?: number;
+    newChunkId?: string;
   }): {
     isDuplicate: boolean;
+    perspectiveShift?: boolean;
     existingId?: string;
     mergedRecallCount?: number;
     mergedUsefulCount?: number;
   } {
     const threshold = params.threshold ?? 0.92;
+    const perspectiveLow = 0.7;
     try {
       const candidates = this.db
         .prepare(
-          `SELECT id, text, embedding, recall_count, useful_count FROM chunks WHERE model = ? LIMIT 500`,
+          `SELECT id, text, embedding, recall_count, useful_count, grade FROM chunks WHERE model = ? LIMIT 500`,
         )
         .all(this.computeProviderKey()) as Array<{
         id: string;
@@ -1415,6 +1418,7 @@ export abstract class MemoryManagerSyncOps {
         embedding: string;
         recall_count: number | null;
         useful_count: number | null;
+        grade: string | null;
       }>;
 
       for (const candidate of candidates) {
@@ -1423,6 +1427,37 @@ export abstract class MemoryManagerSyncOps {
           continue;
         }
         const sim = cosineSimilarity(params.newEmbedding, existingEmb);
+
+        // P6: Perspective shift detection (0.7 <= sim < 0.92)
+        // Same topic but different content — queue for user review
+        if (
+          sim >= perspectiveLow &&
+          sim < threshold &&
+          (candidate.useful_count ?? 0) > 0 &&
+          params.newChunkId
+        ) {
+          try {
+            this.db
+              .prepare(
+                `INSERT INTO pending_perspective_reviews
+                 (existing_chunk_id, existing_text, existing_useful_count, existing_grade, new_chunk_id, new_text, similarity, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              )
+              .run(
+                candidate.id,
+                candidate.text.slice(0, 500),
+                candidate.useful_count ?? 0,
+                candidate.grade ?? "ephemeral",
+                params.newChunkId,
+                params.newText.slice(0, 500),
+                Math.round(sim * 1000) / 1000,
+                Date.now(),
+              );
+          } catch {
+            // Best-effort
+          }
+        }
+
         if (sim >= threshold) {
           const mergedRecall = candidate.recall_count ?? 0;
           const mergedUseful = candidate.useful_count ?? 0;
