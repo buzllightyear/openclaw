@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -34,7 +34,7 @@ import {
   normalizeExtraMemoryPaths,
   runWithConcurrency,
 } from "./internal.js";
-import { type MemoryFileEntry } from "./internal.js";
+import { cosineSimilarity, parseEmbedding, type MemoryFileEntry } from "./internal.js";
 import { ensureMemoryIndexSchema } from "./memory-schema.js";
 import {
   buildCaseInsensitiveExtensionGlob,
@@ -1387,5 +1387,67 @@ export abstract class MemoryManagerSyncOps {
       return true;
     }
     return metaSources.some((source, index) => source !== configuredSources[index]);
+  }
+
+  // P5: Deduplication — find near-duplicate chunks by cosine similarity >= 0.92
+  // and merge recall/useful counts, keeping the richer (longer) text.
+  protected deduplicateChunk(params: {
+    newText: string;
+    newEmbedding: number[];
+    threshold?: number;
+  }): {
+    isDuplicate: boolean;
+    existingId?: string;
+    mergedRecallCount?: number;
+    mergedUsefulCount?: number;
+  } {
+    const threshold = params.threshold ?? 0.92;
+    try {
+      const candidates = this.db
+        .prepare(
+          `SELECT id, text, embedding, recall_count, useful_count FROM chunks WHERE model = ? LIMIT 500`,
+        )
+        .all(this.computeProviderKey()) as Array<{
+        id: string;
+        text: string;
+        embedding: string;
+        recall_count: number | null;
+        useful_count: number | null;
+      }>;
+
+      for (const candidate of candidates) {
+        const existingEmb = parseEmbedding(candidate.embedding);
+        if (existingEmb.length === 0) {
+          continue;
+        }
+        const sim = cosineSimilarity(params.newEmbedding, existingEmb);
+        if (sim >= threshold) {
+          const mergedRecall = candidate.recall_count ?? 0;
+          const mergedUseful = candidate.useful_count ?? 0;
+
+          // Keep the longer (richer) text
+          if (params.newText.length > candidate.text.length) {
+            // New text is richer — update existing chunk's text but keep its ID
+            const contentHash = createHash("sha256")
+              .update(params.newText)
+              .digest("hex")
+              .slice(0, 16);
+            this.db
+              .prepare(`UPDATE chunks SET text = ?, content_hash = ?, updated_at = ? WHERE id = ?`)
+              .run(params.newText, contentHash, Date.now(), candidate.id);
+          }
+
+          return {
+            isDuplicate: true,
+            existingId: candidate.id,
+            mergedRecallCount: mergedRecall,
+            mergedUsefulCount: mergedUseful,
+          };
+        }
+      }
+    } catch {
+      // Dedup is best-effort; don't break indexing
+    }
+    return { isDuplicate: false };
   }
 }

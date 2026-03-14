@@ -869,15 +869,31 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       const embedding = embeddings[i] ?? [];
+
+      // P5: Deduplication check before inserting
+      if (embedding.length > 0) {
+        const dedup = this.deduplicateChunk({
+          newText: chunk.text,
+          newEmbedding: embedding,
+          threshold: 0.92,
+        });
+        if (dedup.isDuplicate) {
+          continue; // Skip duplicate chunk
+        }
+      }
+
       const id = hashText(
         `${options.source}:${entry.path}:${chunk.startLine}:${chunk.endLine}:${chunk.hash}:${this.provider.model}`,
       );
+      // P0: Generate content_hash for memory_stats tracking
+      const contentHash = hashText(chunk.text).slice(0, 16);
       this.db
         .prepare(
-          `INSERT INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO chunks (id, path, source, start_line, end_line, hash, content_hash, model, text, embedding, grade, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ephemeral', ?)
            ON CONFLICT(id) DO UPDATE SET
              hash=excluded.hash,
+             content_hash=excluded.content_hash,
              model=excluded.model,
              text=excluded.text,
              embedding=excluded.embedding,
@@ -890,6 +906,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
           chunk.startLine,
           chunk.endLine,
           chunk.hash,
+          contentHash,
           this.provider.model,
           chunk.text,
           JSON.stringify(embedding),

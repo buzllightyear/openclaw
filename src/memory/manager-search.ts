@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { truncateUtf16Safe } from "../utils.js";
 import { cosineSimilarity, parseEmbedding } from "./internal.js";
@@ -131,6 +132,80 @@ export function listChunks(params: {
     embedding: parseEmbedding(row.embedding),
     source: row.source,
   }));
+}
+
+// P2/P3: Update recall_count and last_recalled_at for returned chunks
+export function updateRecallStats(params: { db: DatabaseSync; chunkIds: string[] }): void {
+  if (params.chunkIds.length === 0) {
+    return;
+  }
+  const now = Date.now();
+  try {
+    const updateChunks = params.db.prepare(
+      `UPDATE chunks SET recall_count = COALESCE(recall_count, 0) + 1,
+                         last_recalled_at = ?
+       WHERE id = ?`,
+    );
+    const updateStats = params.db.prepare(
+      `INSERT INTO memory_stats (content_hash, recall_count, useful_count, last_recalled_at, updated_at)
+       VALUES (?, 1, 0, ?, ?)
+       ON CONFLICT(content_hash) DO UPDATE SET
+         recall_count = recall_count + 1,
+         last_recalled_at = excluded.last_recalled_at,
+         updated_at = excluded.updated_at`,
+    );
+    const getContentHash = params.db.prepare(`SELECT content_hash, text FROM chunks WHERE id = ?`);
+    for (const id of params.chunkIds) {
+      updateChunks.run(now, id);
+      const row = getContentHash.get(id) as
+        | { content_hash: string | null; text: string }
+        | undefined;
+      if (row) {
+        const contentHash =
+          row.content_hash || createHash("sha256").update(row.text).digest("hex").slice(0, 16);
+        updateStats.run(contentHash, now, now);
+      }
+    }
+  } catch {
+    // Recall tracking is best-effort; don't break search on DB write errors
+  }
+}
+
+// P2: RRF (Reciprocal Rank Fusion) merge of vector + keyword results
+export function rrfMerge(params: {
+  vectorResults: SearchRowResult[];
+  keywordResults: SearchRowResult[];
+  vectorWeight?: number;
+  ftsWeight?: number;
+  limit: number;
+}): SearchRowResult[] {
+  const vectorWeight = params.vectorWeight ?? 0.7;
+  const ftsWeight = params.ftsWeight ?? 0.3;
+  const k = 60; // RRF constant
+
+  const scoreMap = new Map<string, { result: SearchRowResult; rrfScore: number }>();
+
+  for (let i = 0; i < params.vectorResults.length; i++) {
+    const r = params.vectorResults[i];
+    const rrfScore = vectorWeight / (k + i + 1);
+    scoreMap.set(r.id, { result: r, rrfScore });
+  }
+
+  for (let i = 0; i < params.keywordResults.length; i++) {
+    const r = params.keywordResults[i];
+    const rrfScore = ftsWeight / (k + i + 1);
+    const existing = scoreMap.get(r.id);
+    if (existing) {
+      existing.rrfScore += rrfScore;
+    } else {
+      scoreMap.set(r.id, { result: r, rrfScore });
+    }
+  }
+
+  return Array.from(scoreMap.values())
+    .toSorted((a, b) => b.rrfScore - a.rrfScore)
+    .slice(0, params.limit)
+    .map((entry) => ({ ...entry.result, score: entry.rrfScore }));
 }
 
 export async function searchKeyword(params: {

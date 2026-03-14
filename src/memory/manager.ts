@@ -21,7 +21,8 @@ import { isFileMissingError, statRegularFile } from "./fs-utils.js";
 import { bm25RankToScore, buildFtsQuery, mergeHybridResults } from "./hybrid.js";
 import { isMemoryPath, normalizeExtraMemoryPaths } from "./internal.js";
 import { MemoryManagerEmbeddingOps } from "./manager-embedding-ops.js";
-import { searchKeyword, searchVector } from "./manager-search.js";
+import { searchKeyword, searchVector, updateRecallStats } from "./manager-search.js";
+import { runMemoryLifecycle } from "./memory-lifecycle.js";
 import { extractKeywords } from "./query-expansion.js";
 import type {
   MemoryEmbeddingProbeResult,
@@ -257,6 +258,33 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   }
 
   async search(
+    query: string,
+    opts?: {
+      maxResults?: number;
+      minScore?: number;
+      sessionKey?: string;
+    },
+  ): Promise<MemorySearchResult[]> {
+    const results = await this._searchInner(query, opts);
+
+    // P3: Update recall stats for returned chunks (best-effort, non-blocking)
+    if (results.length > 0) {
+      try {
+        const chunkIds = results
+          .map((r) => (r as MemorySearchResult & { id?: string }).id)
+          .filter((id): id is string => !!id);
+        if (chunkIds.length > 0) {
+          updateRecallStats({ db: this.db, chunkIds });
+        }
+      } catch {
+        // Recall tracking is best-effort
+      }
+    }
+
+    return results;
+  }
+
+  private async _searchInner(
     query: string,
     opts?: {
       maxResults?: number;
@@ -836,5 +864,15 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     }
     this.db.close();
     INDEX_CACHE.delete(this.cacheKey);
+  }
+
+  // P4: Run memory lifecycle (promotion/demotion) pipeline
+  runLifecycle(): { promoted: number; demoted: number; softDeleted: number } {
+    try {
+      return runMemoryLifecycle({ db: this.db });
+    } catch (err) {
+      log.warn(`memory lifecycle failed: ${String(err)}`);
+      return { promoted: 0, demoted: 0, softDeleted: 0 };
+    }
   }
 }

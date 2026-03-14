@@ -76,8 +76,33 @@ export function ensureMemoryIndexSchema(params: {
 
   ensureColumn(params.db, "files", "source", "TEXT NOT NULL DEFAULT 'memory'");
   ensureColumn(params.db, "chunks", "source", "TEXT NOT NULL DEFAULT 'memory'");
+
+  // P0: Memory upgrade — grade system columns
+  ensureColumn(params.db, "chunks", "content_hash", "TEXT");
+  ensureColumn(params.db, "chunks", "grade", "TEXT DEFAULT 'ephemeral'");
+  ensureColumn(params.db, "chunks", "fact_type", "TEXT");
+  ensureColumn(params.db, "chunks", "tags", "TEXT");
+  ensureColumn(params.db, "chunks", "recall_count", "INTEGER DEFAULT 0");
+  ensureColumn(params.db, "chunks", "useful_count", "INTEGER DEFAULT 0");
+  ensureColumn(params.db, "chunks", "last_recalled_at", "INTEGER");
+
+  // P0: Memory stats table — preserves recall/useful counts across reindexing
+  params.db.exec(`
+    CREATE TABLE IF NOT EXISTS memory_stats (
+      content_hash TEXT PRIMARY KEY,
+      grade TEXT DEFAULT 'ephemeral',
+      recall_count INTEGER DEFAULT 0,
+      useful_count INTEGER DEFAULT 0,
+      last_recalled_at INTEGER,
+      deleted_at INTEGER,
+      updated_at INTEGER
+    );
+  `);
+
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);`);
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);`);
+  params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_grade ON chunks(grade);`);
+  params.db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_stats_grade ON memory_stats(grade);`);
 
   return { ftsAvailable, ...(ftsError ? { ftsError } : {}) };
 }
