@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 
 /**
@@ -34,22 +33,21 @@ export function runMemoryLifecycle(params: { db: DatabaseSync }): LifecycleResul
 
   // --- Promotion ---
 
-  // ephemeral → recurring
+  // ephemeral → recurring (recall >= 3, useful is bonus not required)
   const promoteToRecurring = params.db.prepare(
     `UPDATE chunks SET grade = 'recurring', updated_at = ?
      WHERE grade = 'ephemeral'
-       AND COALESCE(recall_count, 0) >= 3
-       AND COALESCE(useful_count, 0) >= 1`,
+       AND COALESCE(recall_count, 0) >= 3`,
   );
   const r1 = promoteToRecurring.run(now);
   promoted += Number(r1.changes);
 
-  // recurring → permanent
+  // recurring → permanent (recall >= 10, useful >= 1 as quality signal)
   const promoteToPermanent = params.db.prepare(
     `UPDATE chunks SET grade = 'permanent', updated_at = ?
      WHERE grade = 'recurring'
        AND COALESCE(recall_count, 0) >= 10
-       AND COALESCE(useful_count, 0) >= 5`,
+       AND COALESCE(useful_count, 0) >= 1`,
   );
   const r2 = promoteToPermanent.run(now);
   promoted += Number(r2.changes);
@@ -90,77 +88,45 @@ export function runMemoryLifecycle(params: { db: DatabaseSync }): LifecycleResul
   );
   markDeleted.run(now, thirtyDaysAgo);
 
-  // --- Sync memory_stats grades from chunks ---
-  params.db.exec(`
-    UPDATE memory_stats SET grade = (
-      SELECT c.grade FROM chunks c
-      WHERE c.content_hash = memory_stats.content_hash
-        AND c.content_hash IS NOT NULL
-      LIMIT 1
-    ), updated_at = ${now}
-    WHERE content_hash IN (
-      SELECT content_hash FROM chunks WHERE content_hash IS NOT NULL
+  // --- Sync memory_stats grades from chunks (upsert to ensure rows exist) ---
+  const chunksWithHash = params.db
+    .prepare(
+      `SELECT content_hash, grade, recall_count, useful_count, last_recalled_at
+       FROM chunks WHERE content_hash IS NOT NULL AND grade IS NOT NULL AND grade != 'deleted'`,
     )
-    AND deleted_at IS NULL
-  `);
+    .all() as Array<{
+    content_hash: string;
+    grade: string;
+    recall_count: number | null;
+    useful_count: number | null;
+    last_recalled_at: number | null;
+  }>;
+  const upsertStats = params.db.prepare(
+    `INSERT INTO memory_stats (content_hash, grade, recall_count, useful_count, last_recalled_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(content_hash) DO UPDATE SET
+       grade = excluded.grade,
+       recall_count = MAX(memory_stats.recall_count, excluded.recall_count),
+       useful_count = MAX(memory_stats.useful_count, excluded.useful_count),
+       last_recalled_at = COALESCE(excluded.last_recalled_at, memory_stats.last_recalled_at),
+       updated_at = excluded.updated_at
+     WHERE memory_stats.deleted_at IS NULL`,
+  );
+  for (const row of chunksWithHash) {
+    upsertStats.run(
+      row.content_hash,
+      row.grade,
+      row.recall_count ?? 0,
+      row.useful_count ?? 0,
+      row.last_recalled_at,
+      now,
+    );
+  }
 
-  // --- Sync grade changes back to md file frontmatter ---
-  syncGradeToFrontmatter(params.db);
+  // frontmatter sync removed: DB is source of truth for grade
 
   return { promoted, demoted, softDeleted };
 }
 
-/**
- * For chunks whose grade changed (updated_at == recent), rewrite the
- * corresponding frontmatter `grade:` line in the source md file.
- */
-function syncGradeToFrontmatter(db: DatabaseSync): void {
-  // Get chunks that were just updated (within last 5 seconds) and have a path
-  const recentlyChanged = db
-    .prepare(
-      `SELECT DISTINCT path, grade FROM chunks
-       WHERE updated_at > ? AND path IS NOT NULL AND grade IS NOT NULL
-         AND grade != 'deleted'`,
-    )
-    .all(Date.now() - 5000) as Array<{ path: string; grade: string }>;
-
-  // Group by path — use the "highest" grade if multiple chunks in one file
-  const gradeRank: Record<string, number> = { ephemeral: 0, recurring: 1, permanent: 2 };
-  const pathGrades = new Map<string, string>();
-  for (const row of recentlyChanged) {
-    const current = pathGrades.get(row.path);
-    if (!current || (gradeRank[row.grade] ?? 0) > (gradeRank[current] ?? 0)) {
-      pathGrades.set(row.path, row.grade);
-    }
-  }
-
-  for (const [filePath, grade] of pathGrades) {
-    try {
-      if (!fs.existsSync(filePath)) {
-        continue;
-      }
-      let content = fs.readFileSync(filePath, "utf-8");
-
-      // Check if file has frontmatter
-      if (content.startsWith("---")) {
-        const endIdx = content.indexOf("---", 3);
-        if (endIdx > 0) {
-          const frontmatter = content.slice(0, endIdx + 3);
-          const body = content.slice(endIdx + 3);
-
-          if (/^grade:\s*.+$/m.test(frontmatter)) {
-            // Replace existing grade line
-            const updatedFm = frontmatter.replace(/^grade:\s*.+$/m, `grade: ${grade}`);
-            content = updatedFm + body;
-          } else {
-            // Add grade line after opening ---
-            content = `---\ngrade: ${grade}\n${frontmatter.slice(4)}${body}`;
-          }
-          fs.writeFileSync(filePath, content, "utf-8");
-        }
-      }
-    } catch {
-      // Best-effort: don't break lifecycle on file write errors
-    }
-  }
-}
+// syncGradeToFrontmatter removed: DB is source of truth for grade.
+// File frontmatter is not modified by lifecycle.

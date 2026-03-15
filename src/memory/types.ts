@@ -1,6 +1,7 @@
 export type MemorySource = "memory" | "sessions";
 
 export type MemorySearchResult = {
+  id?: string;
   path: string;
   startLine: number;
   endLine: number;

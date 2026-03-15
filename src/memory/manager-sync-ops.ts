@@ -1228,6 +1228,7 @@ export abstract class MemoryManagerSyncOps {
       }
 
       this.writeMeta(nextMeta);
+      this.rehydrateFromMemoryStats();
       this.pruneEmbeddingCacheIfNeeded?.();
 
       this.db.close();
@@ -1296,6 +1297,7 @@ export abstract class MemoryManagerSyncOps {
     }
 
     this.writeMeta(nextMeta);
+    this.rehydrateFromMemoryStats();
     this.pruneEmbeddingCacheIfNeeded?.();
   }
 
@@ -1412,7 +1414,7 @@ export abstract class MemoryManagerSyncOps {
         .prepare(
           `SELECT id, text, embedding, recall_count, useful_count, grade FROM chunks WHERE model = ? LIMIT 500`,
         )
-        .all(this.computeProviderKey()) as Array<{
+        .all(this.provider?.model ?? "fts-only") as Array<{
         id: string;
         text: string;
         embedding: string;
@@ -1464,8 +1466,13 @@ export abstract class MemoryManagerSyncOps {
 
           // Keep the longer (richer) text and merge counts into existing chunk
           const now = Date.now();
+          const oldContentHash = createHash("sha256")
+            .update(candidate.text)
+            .digest("hex")
+            .slice(0, 16);
+
           if (params.newText.length > candidate.text.length) {
-            const contentHash = createHash("sha256")
+            const newContentHash = createHash("sha256")
               .update(params.newText)
               .digest("hex")
               .slice(0, 16);
@@ -1475,12 +1482,53 @@ export abstract class MemoryManagerSyncOps {
               )
               .run(
                 params.newText,
-                contentHash,
+                newContentHash,
                 params.newRecallCount ?? 0,
                 params.newUsefulCount ?? 0,
                 now,
                 candidate.id,
               );
+
+            // Migrate memory_stats from old content_hash to new
+            try {
+              const oldStats = this.db
+                .prepare(
+                  `SELECT grade, recall_count, useful_count, last_recalled_at FROM memory_stats WHERE content_hash = ?`,
+                )
+                .get(oldContentHash) as
+                | {
+                    grade: string;
+                    recall_count: number;
+                    useful_count: number;
+                    last_recalled_at: number | null;
+                  }
+                | undefined;
+              if (oldStats) {
+                this.db
+                  .prepare(
+                    `INSERT INTO memory_stats (content_hash, grade, recall_count, useful_count, last_recalled_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(content_hash) DO UPDATE SET
+                       recall_count = recall_count + excluded.recall_count,
+                       useful_count = useful_count + excluded.useful_count,
+                       last_recalled_at = COALESCE(excluded.last_recalled_at, last_recalled_at),
+                       updated_at = excluded.updated_at`,
+                  )
+                  .run(
+                    newContentHash,
+                    oldStats.grade,
+                    oldStats.recall_count + (params.newRecallCount ?? 0),
+                    oldStats.useful_count + (params.newUsefulCount ?? 0),
+                    oldStats.last_recalled_at,
+                    now,
+                  );
+                this.db
+                  .prepare(`DELETE FROM memory_stats WHERE content_hash = ?`)
+                  .run(oldContentHash);
+              }
+            } catch {
+              // Best-effort memory_stats migration
+            }
           } else {
             // Existing text is richer — just merge counts
             this.db
@@ -1488,6 +1536,22 @@ export abstract class MemoryManagerSyncOps {
                 `UPDATE chunks SET recall_count = COALESCE(recall_count, 0) + ?, useful_count = COALESCE(useful_count, 0) + ?, updated_at = ? WHERE id = ?`,
               )
               .run(params.newRecallCount ?? 0, params.newUsefulCount ?? 0, now, candidate.id);
+
+            // Update memory_stats counts for existing content_hash
+            try {
+              this.db
+                .prepare(
+                  `INSERT INTO memory_stats (content_hash, grade, recall_count, useful_count, updated_at)
+                   VALUES (?, 'ephemeral', ?, ?, ?)
+                   ON CONFLICT(content_hash) DO UPDATE SET
+                     recall_count = recall_count + excluded.recall_count,
+                     useful_count = useful_count + excluded.useful_count,
+                     updated_at = excluded.updated_at`,
+                )
+                .run(oldContentHash, params.newRecallCount ?? 0, params.newUsefulCount ?? 0, now);
+            } catch {
+              // Best-effort memory_stats sync
+            }
           }
 
           return {
@@ -1502,5 +1566,39 @@ export abstract class MemoryManagerSyncOps {
       // Dedup is best-effort; don't break indexing
     }
     return { isDuplicate: false };
+  }
+
+  /**
+   * Post-sync rehydration: restore grade/recall/useful/last_recalled_at
+   * from memory_stats (source of truth) into newly indexed chunks.
+   * Also suppresses soft-deleted chunks from reappearing after reindex.
+   */
+  protected rehydrateFromMemoryStats(): void {
+    try {
+      // 1. Restore state for living memory_stats entries
+      this.db.exec(`
+        UPDATE chunks SET
+          grade = ms.grade,
+          recall_count = ms.recall_count,
+          useful_count = ms.useful_count,
+          last_recalled_at = ms.last_recalled_at
+        FROM memory_stats ms
+        WHERE chunks.content_hash = ms.content_hash
+          AND ms.deleted_at IS NULL
+          AND ms.grade IS NOT NULL
+          AND ms.grade != 'deleted'
+      `);
+
+      // 2. Suppress soft-deleted chunks that reappeared from source files
+      this.db.exec(`
+        UPDATE chunks SET grade = 'deleted'
+        WHERE content_hash IN (
+          SELECT content_hash FROM memory_stats
+          WHERE deleted_at IS NOT NULL
+        )
+      `);
+    } catch {
+      // Best-effort: don't break sync on rehydration errors
+    }
   }
 }
