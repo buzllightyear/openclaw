@@ -930,7 +930,11 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       ? (this._recallBySession.get(sessionKey) ?? [])
       : this._lastRecalledContentHashes;
     if (hashes.length === 0) {
-      // Fallback to chunk IDs if no content hashes
+      if (sessionKey) {
+        // Session-scoped: no recall in this session → no-op (prevent cross-session contamination)
+        return 0;
+      }
+      // No sessionKey: allow global chunkIds fallback
       const ids = this._lastRecalledChunkIds;
       if (ids.length === 0) {
         return 0;
