@@ -1439,22 +1439,49 @@ export abstract class MemoryManagerSyncOps {
           params.newChunkId
         ) {
           try {
-            this.db
+            const existingContentHash = createHash("sha256")
+              .update(candidate.text)
+              .digest("hex")
+              .slice(0, 16);
+            const newContentHash = createHash("sha256")
+              .update(params.newText)
+              .digest("hex")
+              .slice(0, 16);
+            // Canonical pair: sorted hashes for order-independent dedup
+            const [hashA, hashB] = [existingContentHash, newContentHash].toSorted();
+
+            // Check for existing review (any status) to prevent re-queuing decided pairs
+            const existing = this.db
               .prepare(
-                `INSERT INTO pending_perspective_reviews
-                 (existing_chunk_id, existing_text, existing_useful_count, existing_grade, new_chunk_id, new_text, similarity, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                `SELECT COUNT(*) as cnt FROM pending_perspective_reviews
+                 WHERE hash_a = ? AND hash_b = ?`,
               )
-              .run(
-                candidate.id,
-                candidate.text.slice(0, 500),
-                candidate.useful_count ?? 0,
-                candidate.grade ?? "ephemeral",
-                params.newChunkId,
-                params.newText.slice(0, 500),
-                Math.round(sim * 1000) / 1000,
-                Date.now(),
-              );
+              .get(hashA, hashB) as { cnt: number } | undefined;
+
+            if (!existing || existing.cnt === 0) {
+              this.db
+                .prepare(
+                  `INSERT INTO pending_perspective_reviews
+                   (existing_chunk_id, existing_text, existing_useful_count, existing_grade,
+                    new_chunk_id, new_text, similarity, created_at,
+                    existing_content_hash, new_content_hash, hash_a, hash_b)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                )
+                .run(
+                  candidate.id,
+                  candidate.text.slice(0, 500),
+                  candidate.useful_count ?? 0,
+                  candidate.grade ?? "ephemeral",
+                  params.newChunkId,
+                  params.newText.slice(0, 500),
+                  Math.round(sim * 1000) / 1000,
+                  Date.now(),
+                  existingContentHash,
+                  newContentHash,
+                  hashA,
+                  hashB,
+                );
+            }
           } catch {
             // Best-effort
           }
