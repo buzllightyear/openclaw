@@ -26,6 +26,7 @@ export function runMemoryLifecycle(params: { db: DatabaseSync }): LifecycleResul
   const now = Date.now();
   const sixtyDaysAgo = now - 60 * DAY_MS;
   const thirtyDaysAgo = now - 30 * DAY_MS;
+  const sevenDaysAgo = now - 7 * DAY_MS;
 
   let promoted = 0;
   let demoted = 0;
@@ -64,29 +65,31 @@ export function runMemoryLifecycle(params: { db: DatabaseSync }): LifecycleResul
   const r3 = demoteToEphemeral.run(now, sixtyDaysAgo);
   demoted += Number(r3.changes);
 
-  // ephemeral → soft-delete (stale + barely recalled)
+  // ephemeral → soft-delete (stale + barely recalled + older than 7 days)
   const softDelete = params.db.prepare(
     `UPDATE memory_stats SET deleted_at = ?, updated_at = ?
      WHERE content_hash IN (
        SELECT content_hash FROM chunks
        WHERE grade = 'ephemeral'
          AND content_hash IS NOT NULL
+         AND updated_at < ?
          AND (last_recalled_at IS NULL OR last_recalled_at < ?)
          AND COALESCE(recall_count, 0) <= 1
      )
      AND deleted_at IS NULL`,
   );
-  const r4 = softDelete.run(now, now, thirtyDaysAgo);
+  const r4 = softDelete.run(now, now, sevenDaysAgo, thirtyDaysAgo);
   softDeleted += Number(r4.changes);
 
   // Also mark the chunks themselves (grade → 'deleted')
   const markDeleted = params.db.prepare(
     `UPDATE chunks SET grade = 'deleted', updated_at = ?
      WHERE grade = 'ephemeral'
+       AND updated_at < ?
        AND (last_recalled_at IS NULL OR last_recalled_at < ?)
        AND COALESCE(recall_count, 0) <= 1`,
   );
-  markDeleted.run(now, thirtyDaysAgo);
+  markDeleted.run(now, sevenDaysAgo, thirtyDaysAgo);
 
   // --- Sync memory_stats grades from chunks (upsert to ensure rows exist) ---
   const chunksWithHash = params.db
