@@ -79,4 +79,19 @@ export interface MemorySearchManager {
   probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>;
   probeVectorAvailability(): Promise<boolean>;
   close?(): Promise<void>;
+  /** Mark last recalled chunks as useful (content_hash based). Returns count. */
+  markLastRecalledAsUseful?(): number;
+  /** Get pending perspective shift reviews for user notification. */
+  getPendingPerspectiveReviews?(): Array<{
+    id: number;
+    existingText: string;
+    existingUsefulCount: number;
+    existingGrade: string;
+    newText: string;
+    similarity: number;
+    existingContentHash: string | null;
+    newContentHash: string | null;
+  }>;
+  /** Resolve a perspective review. */
+  resolvePerspectiveReview?(reviewId: number, action: "kept" | "replaced" | "kept_both"): void;
 }

@@ -168,6 +168,42 @@ export function createMemoryGetTool(options: {
   });
 }
 
+// --- P6: memory_useful tool ---
+
+export function createMemoryUsefulTool(options: {
+  config?: OpenClawConfig;
+  agentSessionKey?: string;
+}): AnyAgentTool | null {
+  const ctx = resolveMemoryToolContext(options);
+  if (!ctx) {
+    return null;
+  }
+  const { cfg, agentId } = ctx;
+  return {
+    label: "Memory Useful",
+    name: "memory_useful",
+    description:
+      "Mark the most recently recalled memory chunks as useful. Call when the user explicitly indicates the last memory search results were helpful (e.g., /useful command). Returns the number of chunks marked.",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const memory = await getMemoryManagerContext({ cfg, agentId });
+      if ("error" in memory) {
+        return jsonResult({ marked: 0, error: memory.error });
+      }
+      try {
+        const count = memory.manager.markLastRecalledAsUseful?.() ?? 0;
+        return jsonResult({
+          marked: count,
+          message: count > 0 ? `Marked ${count} chunk(s) as useful.` : "No recent recall to mark.",
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return jsonResult({ marked: 0, error: message });
+      }
+    },
+  };
+}
+
 function resolveMemoryCitationsMode(cfg: OpenClawConfig): MemoryCitationsMode {
   const mode = cfg.memory?.citations;
   if (mode === "on" || mode === "off" || mode === "auto") {
