@@ -115,6 +115,20 @@ export function ensureMemoryIndexSchema(params: {
     );
   `);
 
+  // P6 v2: Add content_hash columns + canonical pair for idempotency
+  for (const col of [
+    ["existing_content_hash", "TEXT"],
+    ["new_content_hash", "TEXT"],
+    ["hash_a", "TEXT"],
+    ["hash_b", "TEXT"],
+  ] as const) {
+    try {
+      params.db.exec(`ALTER TABLE pending_perspective_reviews ADD COLUMN ${col[0]} ${col[1]}`);
+    } catch {
+      // Column already exists
+    }
+  }
+
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);`);
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);`);
   params.db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_grade ON chunks(grade);`);

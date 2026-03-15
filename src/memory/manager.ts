@@ -284,8 +284,25 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
         }
         if (chunkIds.length > 0) {
           updateRecallStats({ db: this.db, chunkIds });
-          // Store last recalled chunk IDs for useful_count tracking
           this._lastRecalledChunkIds = chunkIds;
+
+          // Store content_hashes for session-scoped useful tracking
+          try {
+            const hashes: string[] = [];
+            for (const id of chunkIds) {
+              const row = this.db.prepare(`SELECT content_hash FROM chunks WHERE id = ?`).get(id) as
+                | { content_hash: string | null }
+                | undefined;
+              if (row?.content_hash) {
+                hashes.push(row.content_hash);
+              }
+            }
+            if (hashes.length > 0) {
+              this._lastRecalledContentHashes = hashes;
+            }
+          } catch {
+            // Best-effort
+          }
         }
       } catch {
         // Recall tracking is best-effort
@@ -877,21 +894,56 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     INDEX_CACHE.delete(this.cacheKey);
   }
 
-  // P3: Track last recalled chunk IDs for useful_count feedback
+  // P3: Track last recalled chunk IDs and content hashes for useful_count feedback
   private _lastRecalledChunkIds: string[] = [];
+  private _lastRecalledContentHashes: string[] = [];
+
+  /** Get last recalled content hashes (for session-scoped /useful command) */
+  getLastRecalledContentHashes(): string[] {
+    return this._lastRecalledContentHashes;
+  }
 
   /**
    * P3: Mark the most recently recalled chunks as useful.
-   * Call this when user gives positive feedback (e.g. telegram reaction 👍/❤️).
+   * Uses content_hash for stable identification (survives reindex).
+   * Updates both chunks and memory_stats (source of truth).
    */
   markLastRecalledAsUseful(): number {
-    const ids = this._lastRecalledChunkIds;
-    if (ids.length === 0) {
-      return 0;
+    const hashes = this._lastRecalledContentHashes;
+    if (hashes.length === 0) {
+      // Fallback to chunk IDs if no content hashes
+      const ids = this._lastRecalledChunkIds;
+      if (ids.length === 0) {
+        return 0;
+      }
+      try {
+        updateUsefulStats({ db: this.db, chunkIds: ids });
+        return ids.length;
+      } catch {
+        return 0;
+      }
     }
     try {
-      updateUsefulStats({ db: this.db, chunkIds: ids });
-      return ids.length;
+      const now = Date.now();
+      for (const hash of hashes) {
+        // Update chunks (cache)
+        this.db
+          .prepare(
+            `UPDATE chunks SET useful_count = COALESCE(useful_count, 0) + 1, updated_at = ? WHERE content_hash = ?`,
+          )
+          .run(now, hash);
+        // Update memory_stats (source of truth)
+        this.db
+          .prepare(
+            `INSERT INTO memory_stats (content_hash, grade, recall_count, useful_count, updated_at)
+             VALUES (?, 'ephemeral', 0, 1, ?)
+             ON CONFLICT(content_hash) DO UPDATE SET
+               useful_count = useful_count + 1,
+               updated_at = excluded.updated_at`,
+          )
+          .run(hash, now);
+      }
+      return hashes.length;
     } catch {
       return 0;
     }
@@ -900,64 +952,114 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   // P6: Get pending perspective shift reviews for user notification
   getPendingPerspectiveReviews(): Array<{
     id: number;
-    existingChunkId: string;
     existingText: string;
     existingUsefulCount: number;
     existingGrade: string;
-    newChunkId: string;
     newText: string;
     similarity: number;
+    existingContentHash: string | null;
+    newContentHash: string | null;
   }> {
     try {
       const rows = this.db
         .prepare(
-          `SELECT id, existing_chunk_id, existing_text, existing_useful_count,
-                  existing_grade, new_chunk_id, new_text, similarity
+          `SELECT id, existing_text, existing_useful_count,
+                  existing_grade, new_text, similarity,
+                  existing_content_hash, new_content_hash
            FROM pending_perspective_reviews
            WHERE status = 'pending'
            ORDER BY created_at DESC LIMIT 10`,
         )
         .all() as Array<{
         id: number;
-        existing_chunk_id: string;
         existing_text: string;
         existing_useful_count: number;
         existing_grade: string;
-        new_chunk_id: string;
         new_text: string;
         similarity: number;
+        existing_content_hash: string | null;
+        new_content_hash: string | null;
       }>;
       return rows.map((r) => ({
         id: r.id,
-        existingChunkId: r.existing_chunk_id,
         existingText: r.existing_text,
         existingUsefulCount: r.existing_useful_count,
         existingGrade: r.existing_grade,
-        newChunkId: r.new_chunk_id,
         newText: r.new_text,
         similarity: r.similarity,
+        existingContentHash: r.existing_content_hash,
+        newContentHash: r.new_content_hash,
       }));
     } catch {
       return [];
     }
   }
 
-  // P6: Resolve a perspective review — reset old chunk useful_count or keep both
-  resolvePerspectiveReview(reviewId: number, action: "reset" | "keep"): void {
+  // P6: Resolve a perspective review
+  // Actions: "kept" (keep old), "replaced" (replace with new), "kept_both" (keep both)
+  resolvePerspectiveReview(reviewId: number, action: "kept" | "replaced" | "kept_both"): void {
     try {
-      if (action === "reset") {
-        const review = this.db
-          .prepare(`SELECT existing_chunk_id FROM pending_perspective_reviews WHERE id = ?`)
-          .get(reviewId) as { existing_chunk_id: string } | undefined;
-        if (review) {
-          this.db
-            .prepare(`UPDATE chunks SET useful_count = 0, updated_at = ? WHERE id = ?`)
-            .run(Date.now(), review.existing_chunk_id);
-        }
+      const review = this.db
+        .prepare(
+          `SELECT existing_content_hash, new_content_hash, existing_useful_count
+           FROM pending_perspective_reviews WHERE id = ?`,
+        )
+        .get(reviewId) as
+        | {
+            existing_content_hash: string | null;
+            new_content_hash: string | null;
+            existing_useful_count: number;
+          }
+        | undefined;
+
+      if (!review) {
+        return;
       }
+      const now = Date.now();
+
+      if (action === "replaced" && review.existing_content_hash && review.new_content_hash) {
+        // Old: useful_count = 0
+        this.db
+          .prepare(`UPDATE chunks SET useful_count = 0, updated_at = ? WHERE content_hash = ?`)
+          .run(now, review.existing_content_hash);
+        this.db
+          .prepare(
+            `UPDATE memory_stats SET useful_count = 0, updated_at = ? WHERE content_hash = ?`,
+          )
+          .run(now, review.existing_content_hash);
+
+        // New: MAX(current_new_useful, old_useful, 1)
+        const minUseful = Math.max(review.existing_useful_count, 1);
+        this.db
+          .prepare(
+            `UPDATE chunks SET useful_count = MAX(useful_count, ?), updated_at = ? WHERE content_hash = ?`,
+          )
+          .run(minUseful, now, review.new_content_hash);
+        this.db
+          .prepare(
+            `UPDATE memory_stats SET useful_count = MAX(useful_count, ?), updated_at = ?
+             WHERE content_hash = ?`,
+          )
+          .run(minUseful, now, review.new_content_hash);
+      } else if (action === "kept_both" && review.new_content_hash) {
+        // New: MAX(current_new_useful, 1)
+        this.db
+          .prepare(
+            `UPDATE chunks SET useful_count = MAX(useful_count, 1), updated_at = ? WHERE content_hash = ?`,
+          )
+          .run(now, review.new_content_hash);
+        this.db
+          .prepare(
+            `UPDATE memory_stats SET useful_count = MAX(useful_count, 1), updated_at = ?
+             WHERE content_hash = ?`,
+          )
+          .run(now, review.new_content_hash);
+      }
+      // "kept": no changes to useful_count
+
       this.db
         .prepare(`UPDATE pending_perspective_reviews SET status = ? WHERE id = ?`)
-        .run(action === "reset" ? "reset" : "kept", reviewId);
+        .run(action, reviewId);
     } catch {
       // Best-effort
     }
