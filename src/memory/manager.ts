@@ -927,7 +927,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
    */
   markLastRecalledAsUseful(sessionKey?: string): number {
     const hashes = sessionKey
-      ? (this._recallBySession.get(sessionKey) ?? this._lastRecalledContentHashes)
+      ? (this._recallBySession.get(sessionKey) ?? [])
       : this._lastRecalledContentHashes;
     if (hashes.length === 0) {
       // Fallback to chunk IDs if no content hashes

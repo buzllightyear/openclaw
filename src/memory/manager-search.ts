@@ -111,7 +111,7 @@ export function listChunks(params: {
     .prepare(
       `SELECT id, path, start_line, end_line, text, embedding, source\n` +
         `  FROM chunks\n` +
-        ` WHERE model = ?${params.sourceFilter.sql}`,
+        ` WHERE model = ? AND COALESCE(grade, 'ephemeral') != 'deleted'${params.sourceFilter.sql}`,
     )
     .all(params.providerModel, ...params.sourceFilter.params) as Array<{
     id: string;
