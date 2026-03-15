@@ -179,6 +179,7 @@ export function createMemoryUsefulTool(options: {
     return null;
   }
   const { cfg, agentId } = ctx;
+  const sessionKey = options.agentSessionKey;
   return {
     label: "Memory Useful",
     name: "memory_useful",
@@ -191,7 +192,7 @@ export function createMemoryUsefulTool(options: {
         return jsonResult({ marked: 0, error: memory.error });
       }
       try {
-        const count = memory.manager.markLastRecalledAsUseful?.() ?? 0;
+        const count = memory.manager.markLastRecalledAsUseful?.(sessionKey) ?? 0;
         return jsonResult({
           marked: count,
           message: count > 0 ? `Marked ${count} chunk(s) as useful.` : "No recent recall to mark.",

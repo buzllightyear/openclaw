@@ -299,6 +299,17 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
             }
             if (hashes.length > 0) {
               this._lastRecalledContentHashes = hashes;
+              // Session-scoped storage
+              if (opts?.sessionKey) {
+                this._recallBySession.set(opts.sessionKey, hashes);
+                // Evict oldest sessions if map grows too large
+                if (this._recallBySession.size > MemoryIndexManager.MAX_RECALL_SESSIONS) {
+                  const firstKey = this._recallBySession.keys().next().value;
+                  if (firstKey) {
+                    this._recallBySession.delete(firstKey);
+                  }
+                }
+              }
             }
           } catch {
             // Best-effort
@@ -895,11 +906,17 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
   }
 
   // P3: Track last recalled chunk IDs and content hashes for useful_count feedback
+  // Session-scoped: keyed by sessionKey to prevent cross-session contamination
   private _lastRecalledChunkIds: string[] = [];
   private _lastRecalledContentHashes: string[] = [];
+  private _recallBySession = new Map<string, string[]>();
+  private static readonly MAX_RECALL_SESSIONS = 50;
 
-  /** Get last recalled content hashes (for session-scoped /useful command) */
-  getLastRecalledContentHashes(): string[] {
+  /** Get last recalled content hashes for a session (or global fallback) */
+  getLastRecalledContentHashes(sessionKey?: string): string[] {
+    if (sessionKey) {
+      return this._recallBySession.get(sessionKey) ?? [];
+    }
     return this._lastRecalledContentHashes;
   }
 
@@ -908,8 +925,10 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
    * Uses content_hash for stable identification (survives reindex).
    * Updates both chunks and memory_stats (source of truth).
    */
-  markLastRecalledAsUseful(): number {
-    const hashes = this._lastRecalledContentHashes;
+  markLastRecalledAsUseful(sessionKey?: string): number {
+    const hashes = sessionKey
+      ? (this._recallBySession.get(sessionKey) ?? this._lastRecalledContentHashes)
+      : this._lastRecalledContentHashes;
     if (hashes.length === 0) {
       // Fallback to chunk IDs if no content hashes
       const ids = this._lastRecalledChunkIds;
@@ -926,20 +945,22 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     try {
       const now = Date.now();
       for (const hash of hashes) {
-        // Update chunks (cache)
+        // Update chunks (cache) — skip deleted
         this.db
           .prepare(
-            `UPDATE chunks SET useful_count = COALESCE(useful_count, 0) + 1, updated_at = ? WHERE content_hash = ?`,
+            `UPDATE chunks SET useful_count = COALESCE(useful_count, 0) + 1, updated_at = ?
+             WHERE content_hash = ? AND COALESCE(grade, 'ephemeral') != 'deleted'`,
           )
           .run(now, hash);
-        // Update memory_stats (source of truth)
+        // Update memory_stats (source of truth) — skip soft-deleted
         this.db
           .prepare(
             `INSERT INTO memory_stats (content_hash, grade, recall_count, useful_count, updated_at)
              VALUES (?, 'ephemeral', 0, 1, ?)
              ON CONFLICT(content_hash) DO UPDATE SET
                useful_count = useful_count + 1,
-               updated_at = excluded.updated_at`,
+               updated_at = excluded.updated_at
+             WHERE memory_stats.deleted_at IS NULL`,
           )
           .run(hash, now);
       }

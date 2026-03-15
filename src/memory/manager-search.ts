@@ -40,7 +40,7 @@ export async function searchVector(params: {
           `       vec_distance_cosine(v.embedding, ?) AS dist\n` +
           `  FROM ${params.vectorTable} v\n` +
           `  JOIN chunks c ON c.id = v.id\n` +
-          ` WHERE c.model = ?${params.sourceFilterVec.sql}\n` +
+          ` WHERE c.model = ? AND COALESCE(c.grade, 'ephemeral') != 'deleted'${params.sourceFilterVec.sql}\n` +
           ` ORDER BY dist ASC\n` +
           ` LIMIT ?`,
       )
@@ -144,7 +144,7 @@ export function updateRecallStats(params: { db: DatabaseSync; chunkIds: string[]
     const updateChunks = params.db.prepare(
       `UPDATE chunks SET recall_count = COALESCE(recall_count, 0) + 1,
                          last_recalled_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND COALESCE(grade, 'ephemeral') != 'deleted'`,
     );
     const updateStats = params.db.prepare(
       `INSERT INTO memory_stats (content_hash, recall_count, useful_count, last_recalled_at, updated_at)
@@ -152,9 +152,12 @@ export function updateRecallStats(params: { db: DatabaseSync; chunkIds: string[]
        ON CONFLICT(content_hash) DO UPDATE SET
          recall_count = recall_count + 1,
          last_recalled_at = excluded.last_recalled_at,
-         updated_at = excluded.updated_at`,
+         updated_at = excluded.updated_at
+       WHERE (SELECT deleted_at FROM memory_stats WHERE content_hash = excluded.content_hash) IS NULL`,
     );
-    const getContentHash = params.db.prepare(`SELECT content_hash, text FROM chunks WHERE id = ?`);
+    const getContentHash = params.db.prepare(
+      `SELECT content_hash, text FROM chunks WHERE id = ? AND COALESCE(grade, 'ephemeral') != 'deleted'`,
+    );
     for (const id of params.chunkIds) {
       updateChunks.run(now, id);
       const row = getContentHash.get(id) as
@@ -179,11 +182,13 @@ export function updateUsefulStats(params: { db: DatabaseSync; chunkIds: string[]
   const now = Date.now();
   try {
     const updateChunks = params.db.prepare(
-      `UPDATE chunks SET useful_count = COALESCE(useful_count, 0) + 1 WHERE id = ?`,
+      `UPDATE chunks SET useful_count = COALESCE(useful_count, 0) + 1
+       WHERE id = ? AND COALESCE(grade, 'ephemeral') != 'deleted'`,
     );
     const updateStats = params.db.prepare(
       `UPDATE memory_stats SET useful_count = useful_count + 1, updated_at = ?
-       WHERE content_hash = (SELECT content_hash FROM chunks WHERE id = ?)`,
+       WHERE content_hash = (SELECT content_hash FROM chunks WHERE id = ?)
+         AND deleted_at IS NULL`,
     );
     for (const id of params.chunkIds) {
       updateChunks.run(id);
@@ -273,7 +278,19 @@ export async function searchKeyword(params: {
     rank: number;
   }>;
 
-  return rows.map((row) => {
+  // Post-filter: exclude deleted chunks (FTS table doesn't have grade)
+  const filteredRows = rows.filter((row) => {
+    try {
+      const chunk = params.db.prepare(`SELECT grade FROM chunks WHERE id = ?`).get(row.id) as
+        | { grade: string | null }
+        | undefined;
+      return !chunk || chunk.grade !== "deleted";
+    } catch {
+      return true; // Keep on error
+    }
+  });
+
+  return filteredRows.map((row) => {
     const textScore = params.bm25RankToScore(row.rank);
     return {
       id: row.id,

@@ -79,8 +79,8 @@ export interface MemorySearchManager {
   probeEmbeddingAvailability(): Promise<MemoryEmbeddingProbeResult>;
   probeVectorAvailability(): Promise<boolean>;
   close?(): Promise<void>;
-  /** Mark last recalled chunks as useful (content_hash based). Returns count. */
-  markLastRecalledAsUseful?(): number;
+  /** Mark last recalled chunks as useful (content_hash based, session-scoped). Returns count. */
+  markLastRecalledAsUseful?(sessionKey?: string): number;
   /** Get pending perspective shift reviews for user notification. */
   getPendingPerspectiveReviews?(): Array<{
     id: number;
