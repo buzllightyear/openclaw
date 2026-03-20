@@ -1397,6 +1397,13 @@ export class QmdMemoryManager implements MemorySearchManager {
     // connection runs synchronous queries on the main thread via DatabaseSync.
     // In WAL mode readers rarely block, so 1 s is a safe upper bound.
     this.db.exec("PRAGMA busy_timeout = 1000");
+    // WAL mode — inherited from writer if already set, but ensure it here too
+    // so read-only connections benefit from concurrent access.
+    try {
+      this.db.exec("PRAGMA journal_mode = WAL");
+    } catch {
+      /* readOnly may reject */
+    }
     return this.db;
   }
 

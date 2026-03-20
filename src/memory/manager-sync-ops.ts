@@ -272,6 +272,10 @@ export abstract class MemoryManagerSyncOps {
     // Set it on every open so concurrent processes retry instead of
     // failing immediately with SQLITE_BUSY.
     db.exec("PRAGMA busy_timeout = 5000");
+    // WAL mode enables concurrent reader/writer access, preventing
+    // "database is locked" errors from heartbeat scripts and other
+    // external consumers reading while the engine writes.
+    db.exec("PRAGMA journal_mode = WAL");
     return db;
   }
 
